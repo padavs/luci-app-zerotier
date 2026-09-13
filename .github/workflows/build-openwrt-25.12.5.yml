@@ -201,6 +201,17 @@ jobs:
           TAG="v${APK_NAME#luci-app-zerotier-}"
           TAG="${TAG%.apk}"
 
+          # GitHub rewrites '~' to '.' in asset names, which would no longer match
+          # the version string recorded in SHA256SUMS. Stage sanitized copies so
+          # asset names, checksums and download URLs all agree.
+          rm -rf release
+          mkdir -p release
+          for f in output/*.apk; do
+            cp "$f" "release/$(basename "$f" | tr '~' '-')"
+          done
+          cp output/BUILDINFO release/
+          ( cd release && sha256sum *.apk > SHA256SUMS )
+
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --title "luci-app-zerotier ${TAG#v}" \
@@ -210,9 +221,16 @@ jobs:
 
           # Same tag and same asset names on every run, so the download URL stays
           # stable for devices pulling the APK directly.
-          gh release upload "$TAG" output/*.apk output/SHA256SUMS output/BUILDINFO --clobber
+          gh release upload "$TAG" release/* --clobber
+
+          # Drop assets this build no longer produces (e.g. old naming).
+          for existing in $(gh release view "$TAG" --json assets --jq '.assets[].name'); do
+            if [ ! -f "release/$existing" ]; then
+              gh release delete-asset "$TAG" "$existing" --yes
+            fi
+          done
 
           echo "Stable download URLs:"
-          for f in output/*.apk output/SHA256SUMS; do
+          for f in release/*.apk release/SHA256SUMS; do
             echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/$(basename "$f")"
           done
