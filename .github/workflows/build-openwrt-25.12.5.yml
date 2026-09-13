@@ -63,7 +63,7 @@ jobs:
             zlib1g-dev \
             zstd
 
-      - name: Download and verify official SDK
+            - name: Download and verify official SDK
         shell: bash
         run: |
           set -euo pipefail
@@ -73,23 +73,31 @@ jobs:
           wget -O "$SDK_FILE" "${SDK_BASE}/${SDK_FILE}"
           wget -O sha256sums "${SDK_BASE}/sha256sums"
 
-          grep " ${SDK_FILE}$" sha256sums | sha256sum -c -
+          EXPECTED_SHA256="$(
+            awk -v target="$SDK_FILE" '
+              {
+                filename = $NF
+                sub(/^\*/, "", filename)
+                sub(/^\.\//, "", filename)
+
+                if (filename == target) {
+                  print $1
+                  exit
+                }
+              }
+            ' sha256sums
+          )"
+
+          if ! printf '%s\n' "$EXPECTED_SHA256" |
+               grep -Eq '^[0-9a-fA-F]{64}$'; then
+            echo "Cannot find a valid checksum for: $SDK_FILE"
+            exit 1
+          fi
+
+          echo "${EXPECTED_SHA256}  ${SDK_FILE}" | sha256sum -c -
 
           mkdir sdk
           tar --zstd -xf "$SDK_FILE" -C sdk --strip-components=1
-
-      - name: Add luci-app-zerotier source
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p sdk/package/custom/luci-app-zerotier
-
-          rsync -a \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='sdk' \
-            ./ sdk/package/custom/luci-app-zerotier/
 
       - name: Prepare OpenWrt feeds
         shell: bash
