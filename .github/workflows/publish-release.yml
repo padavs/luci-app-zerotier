@@ -1,0 +1,130 @@
+name: Publish APK release assets
+
+# Re-publish already built APK files to the GitHub release without rebuilding.
+# Use it when only the release tag, asset names, checksums or notes change, or
+# when an older build should be promoted. Takes well under a minute.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Build run id to publish (empty = latest successful build run)"
+        required: false
+        default: ""
+      tag:
+        description: "Release tag (empty = derived from the APK name, e.g. v2.2-r31)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Resolve build run
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          RUN_ID="${{ inputs.run_id }}"
+
+          if [ -z "$RUN_ID" ]; then
+            RUN_ID="$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow build-openwrt-25.12.5.yml \
+              --status success \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId')"
+          fi
+
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "No successful build run found."
+            exit 1
+          fi
+
+          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --json databaseId,headSha,conclusion \
+            --jq '"using build run \(.databaseId) (\(.conclusion)) at \(.headSha)"'
+
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: luci-app-zerotier-openwrt-25.12.5
+          path: artifact
+          run-id: ${{ steps.resolve.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Stage release assets
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find artifact -type f -printf '%P\n' | sort
+
+          APK_NAME="$(basename "$(find artifact -name 'luci-app-zerotier-*.apk' | head -n1)")"
+          APK_VERSION="${APK_NAME#luci-app-zerotier-}"
+          APK_VERSION="${APK_VERSION%.apk}"
+
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="v${APK_VERSION}"
+          fi
+
+          # GitHub rewrites '~' to '.' in asset names, so publish URL-safe copies
+          # and checksums that match the uploaded names exactly.
+          rm -rf release
+          mkdir -p release
+
+          while IFS= read -r f; do
+            cp "$f" "release/$(basename "$f" | tr '~' '-')"
+          done < <(find artifact -name '*.apk')
+
+          BUILDINFO="$(find artifact -name BUILDINFO | head -n1 || true)"
+          if [ -n "$BUILDINFO" ]; then
+            cp "$BUILDINFO" release/
+          fi
+
+          ( cd release && sha256sum *.apk > SHA256SUMS )
+          cat release/SHA256SUMS
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.stage.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "luci-app-zerotier ${TAG#v}" \
+              --notes "Published from build run ${{ steps.resolve.outputs.run_id }}" \
+              --latest
+          fi
+
+          gh release upload "$TAG" release/* --clobber
+
+          for existing in $(gh release view "$TAG" --json assets --jq '.assets[].name'); do
+            if [ ! -f "release/$existing" ]; then
+              gh release delete-asset "$TAG" "$existing" --yes
+            fi
+          done
+
+          echo "Stable download URLs:"
+          for f in release/*.apk release/SHA256SUMS; do
+            echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/$(basename "$f")"
+          done
