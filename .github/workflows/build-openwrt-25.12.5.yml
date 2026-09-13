@@ -104,8 +104,10 @@ jobs:
 
           mkdir -p sdk/package/custom/luci-app-zerotier
 
+          # .git is staged on purpose: luci.mk derives the translation package
+          # version from "git log -1 --format=%ct %h -- po", which must resolve
+          # to the audited source commit instead of falling back to "0".
           rsync -a --delete \
-            --exclude '.git/' \
             --exclude '.github/' \
             --exclude 'sdk/' \
             ./ sdk/package/custom/luci-app-zerotier/
