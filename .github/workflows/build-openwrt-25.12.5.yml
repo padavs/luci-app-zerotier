@@ -20,22 +20,19 @@ jobs:
 
     steps:
       - name: Checkout fixed source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: Verify package source
+      - name: Verify audited package source
         shell: bash
         run: |
           set -euo pipefail
 
-          test "$(git rev-parse HEAD^)" = "$EXPECTED_SOURCE_COMMIT" ||
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_COMMIT" ||
-          {
-            echo "Package source is not based on the audited commit."
-            git log -2 --oneline
-            exit 1
-          }
+          git cat-file -e "${EXPECTED_SOURCE_COMMIT}^{commit}"
+          git merge-base --is-ancestor "$EXPECTED_SOURCE_COMMIT" HEAD
+          git diff --quiet "$EXPECTED_SOURCE_COMMIT" HEAD -- \
+            Makefile htdocs root po LICENSE
 
       - name: Install build tools
         shell: bash
@@ -100,6 +97,19 @@ jobs:
           mkdir sdk
           tar --zstd -xf "$SDK_FILE" -C sdk --strip-components=1
 
+      - name: Stage package source into SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p sdk/package/custom/luci-app-zerotier
+
+          rsync -a --delete \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude 'sdk/' \
+            ./ sdk/package/custom/luci-app-zerotier/
+
       - name: Prepare OpenWrt feeds
         shell: bash
         working-directory: sdk
@@ -116,7 +126,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          make package/luci-app-zerotier/compile V=s
+          make package/custom/luci-app-zerotier/compile V=s
 
       - name: Collect results
         shell: bash
