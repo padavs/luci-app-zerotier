@@ -17,6 +17,8 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout fixed source
@@ -187,3 +189,30 @@ jobs:
           path: output/
           if-no-files-found: error
           retention-days: 90
+
+      - name: Publish release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          APK_NAME="$(basename "$(ls output/luci-app-zerotier-*.apk | head -n1)")"
+          TAG="v${APK_NAME#luci-app-zerotier-}"
+          TAG="${TAG%.apk}"
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "luci-app-zerotier ${TAG#v}" \
+              --notes "OpenWrt ${OPENWRT_VERSION} ${OPENWRT_TARGET}/${OPENWRT_SUBTARGET}, package source ${EXPECTED_SOURCE_COMMIT}" \
+              --latest
+          fi
+
+          # Same tag and same asset names on every run, so the download URL stays
+          # stable for devices pulling the APK directly.
+          gh release upload "$TAG" output/*.apk output/SHA256SUMS output/BUILDINFO --clobber
+
+          echo "Stable download URLs:"
+          for f in output/*.apk output/SHA256SUMS; do
+            echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/$(basename "$f")"
+          done
