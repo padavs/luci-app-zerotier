@@ -128,7 +128,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          make package/custom/luci-app-zerotier/compile V=s
+          LOG_FILE=build-luci-app-zerotier.log
+
+          # V=s prints every command of every dependency, which is tens of MB and
+          # makes GitHub truncate the step log in the web UI. Keep the full log in
+          # a file and only echo its tail, so the run view stays readable.
+          if make package/custom/luci-app-zerotier/compile V=s > "$LOG_FILE" 2>&1; then
+            echo "Build succeeded. Last 200 lines of $LOG_FILE:"
+            tail -n 200 "$LOG_FILE"
+          else
+            echo "Build failed. Last 500 lines of $LOG_FILE:"
+            tail -n 500 "$LOG_FILE"
+            exit 1
+          fi
 
       - name: Collect results
         shell: bash
@@ -158,6 +170,15 @@ jobs:
 
           cat output/SHA256SUMS
           cat output/BUILDINFO
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-zerotier-build-log
+          path: sdk/build-luci-app-zerotier.log
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload APK files
         uses: actions/upload-artifact@v4
