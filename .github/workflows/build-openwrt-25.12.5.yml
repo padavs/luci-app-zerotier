@@ -1,0 +1,147 @@
+name: Build OpenWrt 25.12.5 APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  OPENWRT_VERSION: "25.12.5"
+  OPENWRT_TARGET: "mediatek"
+  OPENWRT_SUBTARGET: "filogic"
+  EXPECTED_SOURCE_COMMIT: "c6a223b58e91115ee37812cad6a1b1b54ca0874d"
+  SDK_FILE: "openwrt-sdk-25.12.5-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout fixed source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify package source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_SOURCE_COMMIT" ||
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_COMMIT" ||
+          {
+            echo "Package source is not based on the audited commit."
+            git log -2 --oneline
+            exit 1
+          }
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            flex \
+            bison \
+            g++ \
+            gawk \
+            gcc-multilib \
+            gettext \
+            git \
+            libncurses-dev \
+            libssl-dev \
+            python3-setuptools \
+            rsync \
+            swig \
+            unzip \
+            file \
+            wget \
+            zlib1g-dev \
+            zstd
+
+      - name: Download and verify official SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_BASE="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${OPENWRT_TARGET}/${OPENWRT_SUBTARGET}"
+
+          wget -O "$SDK_FILE" "${SDK_BASE}/${SDK_FILE}"
+          wget -O sha256sums "${SDK_BASE}/sha256sums"
+
+          grep " ${SDK_FILE}$" sha256sums | sha256sum -c -
+
+          mkdir sdk
+          tar --zstd -xf "$SDK_FILE" -C sdk --strip-components=1
+
+      - name: Add luci-app-zerotier source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p sdk/package/custom/luci-app-zerotier
+
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='sdk' \
+            ./ sdk/package/custom/luci-app-zerotier/
+
+      - name: Prepare OpenWrt feeds
+        shell: bash
+        working-directory: sdk
+        run: |
+          set -euo pipefail
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install luci-base zerotier jsonfilter
+          make defconfig
+
+      - name: Build APK
+        shell: bash
+        working-directory: sdk
+        run: |
+          set -euo pipefail
+
+          make package/luci-app-zerotier/compile V=s
+
+      - name: Collect results
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir output
+
+          find sdk/bin -type f \
+            \( -name 'luci-app-zerotier-*.apk' \
+            -o -name 'luci-i18n-zerotier-zh-cn-*.apk' \) \
+            -exec cp -v {} output/ \;
+
+          test -f output/luci-app-zerotier-2.2-r31.apk
+
+          (
+            cd output
+            sha256sum *.apk > SHA256SUMS
+          )
+
+          {
+            echo "OpenWrt: ${OPENWRT_VERSION}"
+            echo "Target: ${OPENWRT_TARGET}/${OPENWRT_SUBTARGET}"
+            echo "Package source: ${EXPECTED_SOURCE_COMMIT}"
+            echo "SDK: ${SDK_FILE}"
+          } > output/BUILDINFO
+
+          cat output/SHA256SUMS
+          cat output/BUILDINFO
+
+      - name: Upload APK files
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-zerotier-openwrt-25.12.5
+          path: output/
+          if-no-files-found: error
+          retention-days: 90
