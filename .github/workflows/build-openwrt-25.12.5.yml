@@ -1,7 +1,25 @@
 name: Build OpenWrt 25.12.5 APK
 
+# One entry point, two paths:
+#   rebuild=false (default)  publish an existing build artifact, ~1 minute
+#   rebuild=true             compile first, then publish, ~17 minutes
+# The build job also runs on its own when only the APK artifact is wanted.
+
 on:
   workflow_dispatch:
+    inputs:
+      rebuild:
+        description: "Rebuild the APK first (~17 min). Leave false to only publish an existing build."
+        type: boolean
+        default: false
+      run_id:
+        description: "Build run id to publish when rebuild=false (empty = latest successful build run that has the artifact)"
+        required: false
+        default: ""
+      tag:
+        description: "Release tag (empty = derived from the APK name, e.g. v2.2-r31)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -12,13 +30,13 @@ env:
   OPENWRT_SUBTARGET: "filogic"
   EXPECTED_SOURCE_COMMIT: "c6a223b58e91115ee37812cad6a1b1b54ca0874d"
   SDK_FILE: "openwrt-sdk-25.12.5-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
+  ARTIFACT_NAME: "luci-app-zerotier-openwrt-25.12.5"
 
 jobs:
   build:
+    if: ${{ inputs.rebuild }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    permissions:
-      contents: write
 
     steps:
       - name: Checkout fixed source
@@ -175,7 +193,7 @@ jobs:
 
       - name: Upload build log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: luci-app-zerotier-build-log
           path: sdk/build-luci-app-zerotier.log
@@ -183,39 +201,134 @@ jobs:
           retention-days: 14
 
       - name: Upload APK files
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: luci-app-zerotier-openwrt-25.12.5
           path: output/
           if-no-files-found: error
           retention-days: 90
 
-      - name: Publish release assets
+  publish:
+    needs: build
+    # Runs after a successful build, and also when the build was skipped on purpose.
+    if: ${{ always() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Resolve artifact source
+        id: source
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 
-          APK_NAME="$(basename "$(ls output/luci-app-zerotier-*.apk | head -n1)")"
-          TAG="v${APK_NAME#luci-app-zerotier-}"
-          TAG="${TAG%.apk}"
+          if [ "${{ inputs.rebuild }}" = "true" ]; then
+            echo "run_id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+            echo "Using the artifact built by this run (${{ github.run_id }})."
+            exit 0
+          fi
+
+          RUN_ID="${{ inputs.run_id }}"
+
+          if [ -n "$RUN_ID" ]; then
+            if ! gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" \
+                 --jq '.artifacts[].name' | grep -qx "$ARTIFACT_NAME"; then
+              echo "Run $RUN_ID has no $ARTIFACT_NAME artifact."
+              exit 1
+            fi
+          else
+            # Publish-only runs succeed without producing an artifact, so walk the
+            # recent successful runs and take the first one that actually has it.
+            WORKFLOW_FILE="$(basename "${GITHUB_WORKFLOW_REF%%@*}")"
+            for candidate in $(gh run list \
+                 --repo "$GITHUB_REPOSITORY" \
+                 --workflow "$WORKFLOW_FILE" \
+                 --status success \
+                 --limit 30 \
+                 --json databaseId \
+                 --jq '.[].databaseId'); do
+              if gh api "repos/$GITHUB_REPOSITORY/actions/runs/$candidate/artifacts" \
+                   --jq '.artifacts[].name' | grep -qx "$ARTIFACT_NAME"; then
+                RUN_ID="$candidate"
+                break
+              fi
+            done
+          fi
+
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "No successful run with the $ARTIFACT_NAME artifact found."
+            exit 1
+          fi
+
+          gh run view "$RUN_ID" --json databaseId,headSha,conclusion \
+            --jq '"using build run \(.databaseId) (\(.conclusion)) at \(.headSha)"'
+
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download APK artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: luci-app-zerotier-openwrt-25.12.5
+          path: artifact
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Stage release assets
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find artifact -type f -printf '%P\n' | sort
+
+          APK_NAME="$(basename "$(find artifact -name 'luci-app-zerotier-*.apk' | head -n1)")"
+          APK_VERSION="${APK_NAME#luci-app-zerotier-}"
+          APK_VERSION="${APK_VERSION%.apk}"
+
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="v${APK_VERSION}"
+          fi
 
           # GitHub rewrites '~' to '.' in asset names, which would no longer match
           # the version string recorded in SHA256SUMS. Stage sanitized copies so
           # asset names, checksums and download URLs all agree.
           rm -rf release
           mkdir -p release
-          for f in output/*.apk; do
+
+          while IFS= read -r f; do
             cp "$f" "release/$(basename "$f" | tr '~' '-')"
-          done
-          cp output/BUILDINFO release/
+          done < <(find artifact -name '*.apk')
+
+          BUILDINFO="$(find artifact -name BUILDINFO | head -n1 || true)"
+          if [ -n "$BUILDINFO" ]; then
+            cp "$BUILDINFO" release/
+          fi
+
           ( cd release && sha256sum *.apk > SHA256SUMS )
+          cat release/SHA256SUMS
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.stage.outputs.tag }}
+        run: |
+          set -euo pipefail
 
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --title "luci-app-zerotier ${TAG#v}" \
-              --notes "OpenWrt ${OPENWRT_VERSION} ${OPENWRT_TARGET}/${OPENWRT_SUBTARGET}, package source ${EXPECTED_SOURCE_COMMIT}" \
+              --notes "OpenWrt ${OPENWRT_VERSION} ${OPENWRT_TARGET}/${OPENWRT_SUBTARGET}, package source ${EXPECTED_SOURCE_COMMIT}, build run ${{ steps.source.outputs.run_id }}" \
               --latest
           fi
 
@@ -223,7 +336,7 @@ jobs:
           # stable for devices pulling the APK directly.
           gh release upload "$TAG" release/* --clobber
 
-          # Drop assets this build no longer produces (e.g. old naming).
+          # Drop assets this publish no longer produces (e.g. old naming).
           for existing in $(gh release view "$TAG" --json assets --jq '.assets[].name'); do
             if [ ! -f "release/$existing" ]; then
               gh release delete-asset "$TAG" "$existing" --yes
