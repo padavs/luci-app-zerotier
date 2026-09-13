@@ -63,7 +63,7 @@ jobs:
             zlib1g-dev \
             zstd
 
-            - name: Download and verify official SDK
+      - name: Download and verify official SDK
         shell: bash
         run: |
           set -euo pipefail
@@ -94,7 +94,8 @@ jobs:
             exit 1
           fi
 
-          echo "${EXPECTED_SHA256}  ${SDK_FILE}" | sha256sum -c -
+          printf '%s  %s\n' "$EXPECTED_SHA256" "$SDK_FILE" |
+            sha256sum -c -
 
           mkdir sdk
           tar --zstd -xf "$SDK_FILE" -C sdk --strip-components=1
